@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "BusinessCloud.Notifications.API": {
+      "commandName": "Project",
+      "commandLineArgs": "--port 7190",
+      "launchBrowser": false
+    }
+  }
+}
