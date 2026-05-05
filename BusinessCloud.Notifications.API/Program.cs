@@ -14,8 +14,9 @@ builder.Services
 
 builder.Services.AddSingleton(_ =>
 {
-    var connectionString = Environment.GetEnvironmentVariable("ACS_ConnectionString")
-        ?? throw new InvalidOperationException("La variable de entorno 'ACS_ConnectionString' no está configurada.");
+    var connectionString = Environment.GetEnvironmentVariable("ACS_CONNECTION_STRING");
+    if (string.IsNullOrWhiteSpace(connectionString))
+        throw new InvalidOperationException("ACS_CONNECTION_STRING is not configured.");
     return new EmailClient(connectionString);
 });
 

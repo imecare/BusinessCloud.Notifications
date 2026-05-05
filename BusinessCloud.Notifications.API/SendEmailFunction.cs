@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.Http;
-using System.ComponentModel.DataAnnotations;
 using System.Net;
 using Azure;
 using Azure.Communication.Email;
@@ -14,105 +13,137 @@ public class SendEmailFunction
 {
     private readonly ILogger<SendEmailFunction> _logger;
     private readonly EmailClient _emailClient;
-    private readonly string _senderAddress;
 
     public SendEmailFunction(ILogger<SendEmailFunction> logger, EmailClient emailClient)
     {
         _logger = logger;
         _emailClient = emailClient;
-
-        _senderAddress = Environment.GetEnvironmentVariable("ACS_SenderAddress")
-            ?? throw new InvalidOperationException("La variable de entorno 'ACS_SenderAddress' no está configurada.");
     }
 
     [Function("SendEmail")]
     public async Task<HttpResponseData> Run(
-        [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+        [HttpTrigger(AuthorizationLevel.Function, "post", "options")] HttpRequestData req)
     {
+        if (req.Method.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
+            return CreateCorsResponse(req, HttpStatusCode.NoContent);
+
         _logger.LogInformation("SendEmail function invoked.");
 
-        SendEmailRequest? emailRequest;
+        var senderAddress = Environment.GetEnvironmentVariable("EMAIL_SENDER_ADDRESS");
+        var acsConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ACS_CONNECTION_STRING"));
+
+        if (!acsConfigured || string.IsNullOrWhiteSpace(senderAddress))
+        {
+            _logger.LogError("Missing required configuration: ACS_CONNECTION_STRING or EMAIL_SENDER_ADDRESS.");
+            return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+            {
+                ok = false,
+                code = "MissingConfiguration",
+                message = "El servidor no tiene la configuración de correo completa. Contacte al administrador."
+            });
+        }
+
+        SendEmailRequest? payload;
         try
         {
-            emailRequest = await req.ReadFromJsonAsync<SendEmailRequest>();
+            payload = await req.ReadFromJsonAsync<SendEmailRequest>();
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Error al deserializar el request body.");
-            var badResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-            await badResponse.WriteAsJsonAsync(new { Error = "El cuerpo del request no es un JSON válido." });
-            return badResponse;
+            _logger.LogWarning(ex, "Failed to deserialize request body.");
+            return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new
+            {
+                ok = false,
+                code = "InvalidPayload",
+                message = "El cuerpo del request no es un JSON válido."
+            });
         }
 
-        if (emailRequest is null)
+        if (payload is null
+            || payload.To is null || payload.To.Length == 0
+            || string.IsNullOrWhiteSpace(payload.Subject)
+            || string.IsNullOrWhiteSpace(payload.Body))
         {
-            var badResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-            await badResponse.WriteAsJsonAsync(new { Error = "El cuerpo del request es requerido." });
-            return badResponse;
-        }
-
-        var validationResults = new List<ValidationResult>();
-        if (!Validator.TryValidateObject(emailRequest, new ValidationContext(emailRequest), validationResults, true))
-        {
-            var errors = validationResults.Select(v => v.ErrorMessage).ToList();
-            _logger.LogWarning("Validación fallida: {Errors}", string.Join("; ", errors));
-            var badResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-            await badResponse.WriteAsJsonAsync(new { Errors = errors });
-            return badResponse;
+            _logger.LogWarning("Payload validation failed.");
+            return await CreateJsonResponse(req, HttpStatusCode.BadRequest, new
+            {
+                ok = false,
+                code = "InvalidPayload",
+                message = "Los campos 'to' (al menos 1), 'subject' y 'body' son requeridos."
+            });
         }
 
         try
         {
             _logger.LogInformation(
-                "Enviando correo desde sistema '{SystemId}' a {RecipientCount} destinatario(s). Asunto: '{Subject}'",
-                emailRequest.SystemId, emailRequest.To.Count, emailRequest.Subject);
+                "Sending email for system '{SystemId}' to {RecipientCount} recipient(s). Subject: '{Subject}'",
+                payload.SystemId ?? "N/A", payload.To.Length, payload.Subject);
 
-            var emailContent = new EmailContent(emailRequest.Subject)
-            {
-                Html = emailRequest.Body
-            };
+            var content = new EmailContent(payload.Subject) { Html = payload.Body };
+            var recipients = new EmailRecipients(payload.To.Select(t => new EmailAddress(t)).ToList());
+            var message = new EmailMessage(senderAddress, recipients, content);
 
-            var recipients = new EmailRecipients(
-                emailRequest.To.Select(to => new EmailAddress(to)).ToList());
-
-            var emailMessage = new EmailMessage(_senderAddress, recipients, emailContent);
-
-            EmailSendOperation operation = await _emailClient.SendAsync(WaitUntil.Completed, emailMessage);
+            EmailSendOperation operation = await _emailClient.SendAsync(WaitUntil.Completed, message);
 
             _logger.LogInformation(
-                "Correo enviado exitosamente. OperationId: {OperationId}, Status: {Status}",
+                "Email sent successfully. OperationId: {OperationId}, Status: {Status}",
                 operation.Id, operation.Value.Status);
 
-            var okResponse = req.CreateResponse(HttpStatusCode.OK);
-            await okResponse.WriteAsJsonAsync(new
+            return await CreateJsonResponse(req, HttpStatusCode.OK, new
             {
-                Message = "Correo enviado exitosamente.",
-                OperationId = operation.Id,
-                Status = operation.Value.Status.ToString()
+                ok = true,
+                status = operation.Value.Status.ToString(),
+                messageId = operation.Id,
+                systemId = payload.SystemId
             });
-            return okResponse;
         }
         catch (RequestFailedException ex)
         {
             _logger.LogError(ex,
-                "Error de Azure Communication Services al enviar correo. StatusCode: {StatusCode}, ErrorCode: {ErrorCode}",
+                "ACS email send failed. StatusCode: {StatusCode}, ErrorCode: {ErrorCode}",
                 ex.Status, ex.ErrorCode);
 
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new
+            return await CreateJsonResponse(req, HttpStatusCode.BadGateway, new
             {
-                Error = "Error al enviar el correo a través de Azure Communication Services.",
-                Detail = ex.Message
+                ok = false,
+                code = ex.ErrorCode ?? "EmailSendFailed",
+                message = "Error al enviar el correo a través de Azure Communication Services.",
+                details = ex.Message
             });
-            return errorResponse;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error inesperado al enviar correo para sistema '{SystemId}'.", emailRequest.SystemId);
+            _logger.LogError(ex, "Unexpected error sending email for system '{SystemId}'.", payload.SystemId);
 
-            var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
-            await errorResponse.WriteAsJsonAsync(new { Error = "Error interno del servidor." });
-            return errorResponse;
+            return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
+            {
+                ok = false,
+                code = "InternalError",
+                message = "Error interno del servidor."
+            });
         }
+    }
+
+    private static HttpResponseData CreateCorsResponse(HttpRequestData req, HttpStatusCode statusCode)
+    {
+        var response = req.CreateResponse(statusCode);
+        AddCorsHeaders(response, req);
+        return response;
+    }
+
+    private static async Task<HttpResponseData> CreateJsonResponse<T>(HttpRequestData req, HttpStatusCode statusCode, T body)
+    {
+        var response = req.CreateResponse(statusCode);
+        AddCorsHeaders(response, req);
+        await response.WriteAsJsonAsync(body);
+        return response;
+    }
+
+    private static void AddCorsHeaders(HttpResponseData response, HttpRequestData req)
+    {
+        var allowedOrigin = Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGIN") ?? "*";
+        response.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
+        response.Headers.Add("Access-Control-Allow-Methods", "POST, OPTIONS");
+        response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, x-functions-key");
     }
 }
