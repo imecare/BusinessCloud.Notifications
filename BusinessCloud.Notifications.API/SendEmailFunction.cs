@@ -29,12 +29,12 @@ public class SendEmailFunction
 
         _logger.LogInformation("SendEmail function invoked.");
 
-        var senderAddress = Environment.GetEnvironmentVariable("EMAIL_SENDER_ADDRESS");
-        var acsConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ACS_CONNECTION_STRING"));
+        var senderAddress = Environment.GetEnvironmentVariable("ACS_SenderAddress");
+        var acsConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("ACS_ConnectionString"));
 
         if (!acsConfigured || string.IsNullOrWhiteSpace(senderAddress))
         {
-            _logger.LogError("Missing required configuration: ACS_CONNECTION_STRING or EMAIL_SENDER_ADDRESS.");
+            _logger.LogError("Missing required configuration: ACS_ConnectionString or ACS_SenderAddress.");
             return await CreateJsonResponse(req, HttpStatusCode.InternalServerError, new
             {
                 ok = false,
